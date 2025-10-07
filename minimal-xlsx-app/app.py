@@ -8,21 +8,11 @@ st.title("Upload → Transform → Download (.xlsx)")
 
 # ---- Paste your transformation here ----
 def transform(df: pd.DataFrame) -> pd.DataFrame:
-    # 🧩 ALL-IN-ONE SURVEY CLEANER — wide questions use "Question - Option" headers
-    # Paste into a Jupyter cell and run. Make sure your Excel file is in the same folder.
-    
-    import pandas as pd
-    import numpy as np
     import re
-    import os
-    
-    # ===== CONFIG =====
-    input_file = "06_26_data.xlsx"     # your survey Excel file
-    sheet_name = "All Data"            # sheet name to read
-    outprefix = "06_26_data_tidy"      # output file prefix
-    delimiter = "; "                   # joiner for multiple answers in single-column questions
-    
-    # Questions to KEEP as multiple columns (one-hot per option)
+    import numpy as np
+    import pandas as pd
+
+    delimiter = "; "
     KEEP_WIDE_PREFIXES = [
         "3. Which best describes you? (select all that apply)",
         "5. Which social media platforms do you use most often to find updates on sustainability/circular economy?",
@@ -33,8 +23,7 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
         "10. My preferred content format(s) (choose all that apply):",
         "11. What topic or question about circular economy do you most want circular.ie to answer:",
     ]
-    # ==================
-    
+
     def build_question_groups(columns, option_labels):
         question_groups = {}
         current_q = None
@@ -46,7 +35,7 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
                 if current_q is not None:
                     question_groups.setdefault(current_q, []).append((idx, str(option_labels.iloc[idx]).strip()))
         return question_groups
-    
+
     def combine_selected_options(row, indices, labels, delimiter):
         selected = []
         for idx, label in zip(indices, labels):
@@ -54,10 +43,7 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
             if pd.isna(val) or (isinstance(val, str) and val.strip() == ""):
                 continue
             label_clean = ("" if pd.isna(label) else str(label)).strip()
-            if label_clean:
-                selected.append(label_clean)
-            else:
-                selected.append(str(val).strip())
+            selected.append(label_clean if label_clean else str(val).strip())
         if not selected:
             return np.nan
         seen, unique = set(), []
@@ -66,44 +52,37 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
                 seen.add(s)
                 unique.append(s)
         return unique[0] if len(unique) == 1 else delimiter.join(unique)
-    
+
     def is_keep_wide(question: str) -> bool:
         q_norm = question.strip()
         return any(q_norm.startswith(p.strip()) for p in KEEP_WIDE_PREFIXES)
-    
-    # ===== LOAD DATA =====
-    print("Reading Excel file...")
-    raw = pd.read_excel(input_file, sheet_name=sheet_name)
-    
-    if raw.empty or raw.shape[0] < 2:
-        raise ValueError("The sheet seems empty or missing the option label row.")
-    
-    option_labels = raw.iloc[0].astype(object).fillna("")
-    columns = list(raw.columns)
-    data = raw.iloc[1:].reset_index(drop=True)
-    
-    # ===== DETECT QUESTIONS =====
+
+    # ===== Use the DataFrame that Streamlit sends =====
+    if df.empty or df.shape[0] < 2:
+        raise ValueError("The sheet seems empty or missing the option label row (first row).")
+
+    option_labels = df.iloc[0].astype(object).fillna("")
+    columns = list(df.columns)
+    data = df.iloc[1:].reset_index(drop=True)
+
+    # Detect numbered questions
     question_groups = build_question_groups(columns, option_labels)
-    q_pattern = re.compile(r"^\s*\d+\.\s+")
+    q_pattern = re.compile(r"^\\s*\\d+\\.\\s+")
     numbered_questions = [q for q in question_groups.keys() if q_pattern.match(q)]
-    
+
     # Identify metadata columns
-    q_col_indices = set()
-    for q in numbered_questions:
-        for idx, _ in question_groups[q]:
-            q_col_indices.add(idx)
+    q_col_indices = {i for q in numbered_questions for i, _ in question_groups[q]}
     q_col_names = {columns[i] for i in q_col_indices}
     metadata_cols = [c for c in columns if c not in q_col_names]
-    
-    # ===== BUILD OUTPUT =====
+
+    # Build output
     mixed = pd.DataFrame(index=data.index)
-    
+
     for q in numbered_questions:
         idxs = [i for i, _ in question_groups[q]]
         labels = [lbl for _, lbl in question_groups[q]]
-    
+
         if is_keep_wide(q):
-            # Expand each option as a separate column with header "Question - Option"
             if len(idxs) == 1 and (labels[0] == "" or str(labels[0]).lower() == "nan"):
                 mixed[q] = data.iloc[:, idxs[0]]
             else:
@@ -118,37 +97,21 @@ def transform(df: pd.DataFrame) -> pd.DataFrame:
                     )
                     mixed[colname] = col_values.astype(int)
         else:
-            # Collapse to a single text column
             if len(idxs) == 1 and (labels[0] == "" or str(labels[0]).lower() == "nan"):
                 mixed[q] = data.iloc[:, idxs[0]]
             else:
                 mixed[q] = data.apply(lambda r: combine_selected_options(r, idxs, labels, delimiter), axis=1)
-    
-    # ===== ADD METADATA =====
+
+    # Add metadata
     preferred = ["Date", "Time Taken", "Country Code", "Region Code", "First Name", "Last Name",
                  "Email", "Custom Field", "Participant tracking code", "Completed", "External ID"]
     ordered_meta = [c for c in preferred if c in data.columns] + [c for c in metadata_cols if c not in preferred]
     for c in ordered_meta:
         if c in data.columns:
             mixed[c] = data[c]
-    
-    # ===== ADD USER_ID COLUMN =====
-    base_name = os.path.splitext(os.path.basename(input_file))[0].replace("_", "")
-    mixed.insert(0, "User_ID", [f"{base_name}_{i+1:02d}" for i in range(len(mixed))])
-    
-    # ===== SAVE =====
-    csv_path = f"{outprefix}.csv"
-    xlsx_path = f"{outprefix}.xlsx"
-    mixed.to_csv(csv_path, index=False)
-    mixed.to_excel(xlsx_path, index=False)
-    
-    print(f"✅ Saved data to:\n  • {csv_path}\n  • {xlsx_path}")
-    
-    # ===== PREVIEW =====
-    print("\nPreview:")
-    display(mixed.head(10))
-    
-    return df
+
+    return mixed
+
 # ----------------------------------------
 
 uploaded = st.file_uploader("Upload an Excel file (.xlsx)", type=["xlsx"])
