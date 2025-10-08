@@ -1,6 +1,7 @@
 import io
 import os
 import re
+import unicodedata
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -9,7 +10,7 @@ st.set_page_config(page_title="ALL-IN-ONE SURVEY CLEANER", layout="centered")
 st.title("🧩 ALL-IN-ONE SURVEY CLEANER")
 st.caption("Upload the raw survey Excel → tidy using your rules → download CSV/XLSX")
 
-# ===== UI SETTINGS =====
+# ========= Sidebar settings =========
 with st.sidebar:
     st.header("Settings")
     sheet_name = st.text_input("Sheet name", value="All Data")
@@ -33,17 +34,28 @@ with st.sidebar:
 def parse_keep_wide(text: str):
     return [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-# ====== YOUR HELPERS (unchanged) ======
+# ========= Helpers (robust to weird spaces/headers) =========
+def norm(s):
+    """Normalise text: NFKC, collapse whitespace, strip NBSP."""
+    s = "" if pd.isna(s) else str(s)
+    s = unicodedata.normalize("NFKC", s).replace("\u00A0", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
 def build_question_groups(columns, option_labels):
+    """
+    Group consecutive 'Unnamed:' columns under the last non-Unnamed header.
+    Returns: { question_header: [(col_index, option_label_norm), ...], ... }
+    """
     question_groups = {}
     current_q = None
     for idx, col in enumerate(columns):
         if not str(col).startswith("Unnamed"):
             current_q = str(col)
-            question_groups.setdefault(current_q, []).append((idx, str(option_labels.iloc[idx]).strip()))
+            question_groups.setdefault(current_q, []).append((idx, norm(option_labels.iloc[idx])))
         else:
             if current_q is not None:
-                question_groups.setdefault(current_q, []).append((idx, str(option_labels.iloc[idx]).strip()))
+                question_groups.setdefault(current_q, []).append((idx, norm(option_labels.iloc[idx])))
     return question_groups
 
 def combine_selected_options(row, indices, labels, delimiter):
@@ -52,13 +64,11 @@ def combine_selected_options(row, indices, labels, delimiter):
         val = row.iloc[idx]
         if pd.isna(val) or (isinstance(val, str) and val.strip() == ""):
             continue
-        label_clean = ("" if pd.isna(label) else str(label)).strip()
-        if label_clean:
-            selected.append(label_clean)
-        else:
-            selected.append(str(val).strip())
+        label_clean = norm(label)
+        selected.append(label_clean if label_clean else str(val).strip())
     if not selected:
         return np.nan
+    # de-duplicate preserving order
     seen, unique = set(), []
     for s in selected:
         if s not in seen:
@@ -67,94 +77,114 @@ def combine_selected_options(row, indices, labels, delimiter):
     return unique[0] if len(unique) == 1 else delimiter.join(unique)
 
 def make_is_keep_wide(keep_wide_prefixes):
+    kp = [norm(p) for p in keep_wide_prefixes]
     def _inner(question: str) -> bool:
-        q_norm = question.strip()
-        return any(q_norm.startswith(p.strip()) for p in keep_wide_prefixes)
+        qn = norm(question)
+        return any(qn.startswith(p) for p in kp)
     return _inner
 
-# ====== THE TRANSFORM (uses the uploaded DataFrame; no file I/O) ======
-def transform(df: pd.DataFrame, delimiter: str, keep_wide_prefixes: list[str]) -> pd.DataFrame:
-    if df.empty or df.shape[0] < 2:
-        raise ValueError("The sheet seems empty or missing the option label row (first row).")
+# ========= Core transform (no file I/O) =========
+def transform(df: pd.DataFrame, delimiter: str = "; ", keep_wide_prefixes=None) -> pd.DataFrame:
+    if keep_wide_prefixes is None:
+        keep_wide_prefixes = []
 
+    if df.empty or df.shape[0] < 2:
+        raise ValueError("The sheet seems empty or missing the option-label row (row 1).")
+
+    # Normalised headers for detection; keep originals for indexing
+    cols_norm = [norm(c) for c in df.columns]
     option_labels = df.iloc[0].astype(object).fillna("")
-    columns = list(df.columns)
     data = df.iloc[1:].reset_index(drop=True)
 
-    # Detect questions
-    question_groups = build_question_groups(columns, option_labels)
-    q_pattern = re.compile(r"^\s*\d+\.\s+")
-    numbered_questions = [q for q in question_groups.keys() if q_pattern.match(q)]
+    # Find the first numbered question (e.g., "1. ..."); everything before is metadata
+    num_pat = re.compile(r"^\d+\.\s+")
+    q_starts = [i for i, c in enumerate(cols_norm) if num_pat.match(c)]
+    if not q_starts:
+        # fallback: accept "1 " or "1-" too
+        num_pat_alt = re.compile(r"^\d+[\.\- ]\s*")
+        q_starts = [i for i, c in enumerate(cols_norm) if num_pat_alt.match(c)]
+    q_start_idx = min(q_starts) if q_starts else 0
 
-    # Identify metadata columns
-    q_col_indices = set()
-    for q in numbered_questions:
-        for idx, _ in question_groups[q]:
-            q_col_indices.add(idx)
-    q_col_names = {columns[i] for i in q_col_indices}
-    metadata_cols = [c for c in columns if c not in q_col_names]
+    # Build groups (header + its Unnamed columns)
+    groups = build_question_groups(list(df.columns), option_labels)
+    is_keep_wide = make_is_keep_wide(keep_wide_prefixes)
+
+    # Split groups into questions vs metadata based on position
+    questions = []
+    metadata_cols = []
+    for q_text, idx_lbls in groups.items():
+        first_idx = idx_lbls[0][0]
+        if first_idx >= q_start_idx:
+            questions.append(q_text)
+        else:
+            # add all columns from this group as metadata columns
+            metadata_cols.extend([df.columns[i] for i, _ in idx_lbls])
+
+    # Preferred metadata ordering
+    preferred_meta = [
+        "Date","Time Taken","Country Code","Region Code","First Name","Last Name",
+        "Email","Custom Field","Participant tracking code","Completed","External ID"
+    ]
+    # Keep originals but sort by preferred first
+    meta_in_data = [c for c in df.columns if c in metadata_cols]
+    ordered_meta = [c for c in df.columns if norm(c) in set(map(norm, preferred_meta))]
+    ordered_meta += [c for c in meta_in_data if c not in ordered_meta]
 
     # Build output
     mixed = pd.DataFrame(index=data.index)
-    is_keep_wide = make_is_keep_wide(keep_wide_prefixes)
 
-    for q in numbered_questions:
-        idxs = [i for i, _ in question_groups[q]]
-        labels = [lbl for _, lbl in question_groups[q]]
+    for q in questions:
+        idxs = [i for i, _ in groups[q]]
+        labels = [lbl for _, lbl in groups[q]]
+        q_name = norm(q)
 
         if is_keep_wide(q):
-            # Expand each option as a separate column with header "Question - Option"
-            if len(idxs) == 1 and (labels[0] == "" or str(labels[0]).lower() == "nan"):
-                mixed[q] = data.iloc[:, idxs[0]]
+            # one-hot per option
+            if len(idxs) == 1 and (labels[0] == "" or norm(labels[0]).lower() == "nan"):
+                mixed[q_name] = data.iloc[:, idxs[0]]
             else:
-                all_empty = all((str(l).strip() == "" or str(l).lower() == "nan") for l in labels)
+                all_empty = all((norm(l) == "" or norm(l).lower() == "nan") for l in labels)
                 for j, (idx, lbl) in enumerate(zip(idxs, labels), start=1):
-                    label_clean = str(lbl).strip()
-                    if all_empty or label_clean == "" or label_clean.lower() == "nan":
-                        label_clean = f"Option {j}"
-                    colname = f"{q} - {label_clean}"
+                    label_clean = norm(lbl) or f"Option {j}"
+                    colname = f"{q_name} - {label_clean}"
                     col_values = data.iloc[:, idx].apply(
-                        lambda v: 1 if (not pd.isna(v) and (not isinstance(v, str) or v.strip() != "")) else 0
+                        lambda v: 1 if (not pd.isna(v) and str(v).strip() != "") else 0
                     )
                     mixed[colname] = col_values.astype(int)
         else:
-            # Collapse to a single text column
-            if len(idxs) == 1 and (labels[0] == "" or str(labels[0]).lower() == "nan"):
-                mixed[q] = data.iloc[:, idxs[0]]
+            # collapse multiple option columns into a single delimited text cell
+            if len(idxs) == 1 and (labels[0] == "" or norm(labels[0]).lower() == "nan"):
+                mixed[q_name] = data.iloc[:, idxs[0]]
             else:
-                mixed[q] = data.apply(lambda r: combine_selected_options(r, idxs, labels, delimiter), axis=1)
+                mixed[q_name] = data.apply(lambda r: combine_selected_options(r, idxs, labels, delimiter), axis=1)
 
-    # Add metadata
-    preferred = ["Date", "Time Taken", "Country Code", "Region Code", "First Name", "Last Name",
-                 "Email", "Custom Field", "Participant tracking code", "Completed", "External ID"]
-    ordered_meta = [c for c in preferred if c in data.columns] + [c for c in metadata_cols if c not in preferred]
+    # Append metadata columns at the end (preferred order first)
     for c in ordered_meta:
         if c in data.columns:
-            mixed[c] = data[c]
+            mixed[norm(c)] = data[c]
 
     return mixed
 
-# ====== APP FLOW ======
+# ========= App flow =========
 uploaded = st.file_uploader("Upload your raw survey Excel (.xlsx)", type=["xlsx"])
 if uploaded is not None:
     st.success(f"File received: {uploaded.name}")
 
     if st.button("Run transformation"):
         try:
-            # Read the selected sheet from the uploaded file (first row = option labels)
             raw = pd.read_excel(uploaded, sheet_name=sheet_name)
             keep_wide_prefixes = parse_keep_wide(keep_wide_text)
 
             mixed = transform(raw, delimiter=delimiter, keep_wide_prefixes=keep_wide_prefixes)
 
-            # Add USER_ID based on uploaded filename (your original behaviour, but cloud-safe)
+            # Add USER_ID based on uploaded filename
             base_name = os.path.splitext(os.path.basename(uploaded.name))[0].replace("_", "")
             mixed.insert(0, "User_ID", [f"{base_name}_{i+1:02d}" for i in range(len(mixed))])
 
             st.success("Transformation complete ✔️")
-            st.dataframe(mixed.head(20))
+            st.dataframe(mixed.head(20), use_container_width=True)
 
-            # Downloads
+            # Download buttons
             csv_bytes = mixed.to_csv(index=False).encode("utf-8")
             st.download_button(
                 "⬇️ Download CSV",
@@ -175,7 +205,7 @@ if uploaded is not None:
             )
 
         except Exception as e:
-            st.error(f"Failed to process file: {e}")
+            st.error(f"Failed to process: {e}")
             st.exception(e)
 else:
     st.info("Upload a .xlsx file to begin.")
